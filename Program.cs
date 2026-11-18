@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Media;
 using System.Runtime.InteropServices;
@@ -20,6 +21,7 @@ internal static class Program
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
 
         try
         {
@@ -37,32 +39,33 @@ internal sealed class CaptureApplication : ApplicationContext
 {
     private readonly NotifyIcon tray;
     private readonly ContextMenuStrip menu;
-    private readonly GlobalHotkey hotkey;
+    private readonly GlobalHotkeys hotkeys;
     private readonly OcrEngine engine;
-    private bool selectingOrReading;
+    private Rectangle? captureArea;
+    private IntPtr targetWindow;
+    private uint targetProcessId;
+    private bool busy;
 
     public CaptureApplication()
     {
         engine = OcrEngine.TryCreateFromLanguage(new Language("en-US"))
                  ?? OcrEngine.TryCreateFromUserProfileLanguages()
                  ?? throw new InvalidOperationException(
-                     "Windows no tiene un idioma de OCR compatible instalado. " +
-                     "Activa el reconocimiento de texto en las características de idioma de Windows.");
+                     "No hay OCR compatible en Windows. Activa reconocimiento de texto en los idiomas instalados.");
 
         menu = new ContextMenuStrip();
         menu.Items.Add("Salir", null, (_, _) => ExitThread());
-
         tray = new NotifyIcon
         {
             Icon = SystemIcons.Application,
-            Text = "GTA Codigo OCR - F8 para capturar",
+            Text = "GTA Codigo OCR V3 - F6 destino, F7 zona, F8 enviar",
             ContextMenuStrip = menu,
             Visible = true
         };
 
         try
         {
-            hotkey = new GlobalHotkey(StartSelection);
+            hotkeys = new GlobalHotkeys(HandleHotkey);
         }
         catch
         {
@@ -70,26 +73,75 @@ internal sealed class CaptureApplication : ApplicationContext
             menu.Dispose();
             throw;
         }
+
+        Notify("Configura F7 (zona) y F6 (navegador); después F8 captura y envía.");
     }
 
-    private void StartSelection()
+    private void HandleHotkey(Keys key)
     {
-        if (selectingOrReading) return;
-        selectingOrReading = true;
+        switch (key)
+        {
+            case Keys.F6: RegisterDestination(); break;
+            case Keys.F7: ChooseRegion(); break;
+            case Keys.F8: CaptureAndSend(); break;
+        }
+    }
+
+    private void RegisterDestination()
+    {
+        if (busy) return;
+        IntPtr window = Native.GetForegroundWindow();
+        if (window == IntPtr.Zero || !Native.IsWindow(window))
+        {
+            Notify("No se encontró la ventana activa.", ToolTipIcon.Warning);
+            return;
+        }
+
+        Native.GetWindowThreadProcessId(window, out uint processId);
+        if (processId == 0 || processId == (uint)Environment.ProcessId)
+        {
+            Notify("Primero abre la página de canje y selecciona el campo del código.",
+                ToolTipIcon.Warning);
+            return;
+        }
+
+        // Se registra la ventana visible; el campo de texto debe estar enfocado.
+        targetWindow = window;
+        targetProcessId = processId;
+        var title = new System.Text.StringBuilder(100);
+        Native.GetWindowText(window, title, title.Capacity);
+        string caption = title.ToString();
+        if (caption.Length > 55) caption = caption[..55];
+        Notify("Destino registrado: " + (caption.Length == 0 ? "navegador" : caption));
+        SystemSounds.Asterisk.Play();
+    }
+
+    private void ChooseRegion()
+    {
+        if (busy) return;
+        busy = true;
         Bitmap? snapshot = null;
         SelectionOverlay? overlay = null;
         try
         {
-            // F8 congela el fotograma en memoria: no se pierde el código mientras seleccionas.
-            Rectangle desktop = SystemInformation.VirtualScreen;
-            snapshot = new Bitmap(desktop.Width, desktop.Height, PixelFormat.Format32bppArgb);
+            Rectangle screen = SystemInformation.VirtualScreen;
+            snapshot = new Bitmap(screen.Width, screen.Height, PixelFormat.Format32bppArgb);
             using (var g = Graphics.FromImage(snapshot))
-                g.CopyFromScreen(desktop.Location, Point.Empty, desktop.Size,
+                g.CopyFromScreen(screen.Location, Point.Empty, screen.Size,
                     CopyPixelOperation.SourceCopy);
 
-            overlay = new SelectionOverlay(snapshot, desktop);
-            snapshot = null;
-            overlay.Completed += OnSelectionCompleted;
+            overlay = new SelectionOverlay(snapshot, screen);
+            snapshot = null; // SelectionOverlay es propietaria de la imagen.
+            overlay.Completed += result =>
+            {
+                if (result.HasValue)
+                {
+                    captureArea = result.Value;
+                    Notify($"Zona guardada: {result.Value.Width} x {result.Value.Height} píxeles. Usa F8.");
+                    SystemSounds.Asterisk.Play();
+                }
+                busy = false;
+            };
             overlay.Show();
             overlay.Activate();
         }
@@ -97,143 +149,220 @@ internal sealed class CaptureApplication : ApplicationContext
         {
             overlay?.Dispose();
             snapshot?.Dispose();
-            selectingOrReading = false;
-            tray.ShowBalloonTip(2000, "GTA Codigo OCR", ex.Message, ToolTipIcon.Error);
+            busy = false;
+            Notify(ex.Message, ToolTipIcon.Error);
         }
     }
 
-    private async void OnSelectionCompleted(Bitmap? selected)
+    private async void CaptureAndSend()
     {
-        if (selected is null)
+        if (busy) return;
+        if (captureArea is null)
         {
-            selectingOrReading = false;
+            Notify("Primero pulsa F7 para seleccionar la zona donde aparece el código.",
+                ToolTipIcon.Warning);
+            return;
+        }
+        if (targetWindow == IntPtr.Zero || !Native.IsWindow(targetWindow))
+        {
+            Notify("Primero pulsa F6 dentro del navegador de canje, con el campo enfocado.",
+                ToolTipIcon.Warning);
             return;
         }
 
-        using (selected)
+        Rectangle region = captureArea.Value;
+        if (!SystemInformation.VirtualScreen.Contains(region))
+        {
+            Notify("La configuración de pantallas cambió. Vuelve a seleccionar la zona con F7.",
+                ToolTipIcon.Warning);
+            return;
+        }
+
+        busy = true;
+        try
+        {
+            // F8 captura inmediatamente SOLO la zona previamente seleccionada.
+            // Todo permanece en RAM: no se guarda ninguna imagen en disco.
+            using var screenshot = new Bitmap(region.Width, region.Height,
+                PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(screenshot))
+                g.CopyFromScreen(region.Location, Point.Empty, region.Size,
+                    CopyPixelOperation.SourceCopy);
+
+            OcrDecision decision = await RecognizeWithAgreementAsync(screenshot);
+            if (decision.Code is null)
+            {
+                Notify(decision.Message, ToolTipIcon.Warning);
+                SystemSounds.Exclamation.Play();
+                return;
+            }
+
+            string code = decision.Code;
+            bool copied = await CopyAsync(code);
+            if (!copied)
+            {
+                Notify("No se pudo copiar al portapapeles.", ToolTipIcon.Error);
+                return;
+            }
+
+            // Si cambió la ventana registrada, NUNCA enviamos pulsaciones a otra app.
+            if (!Native.IsWindow(targetWindow) ||
+                Native.GetWindowThreadProcessId(targetWindow, out uint pid) == 0 ||
+                pid != targetProcessId)
+            {
+                Notify("El navegador registrado se cerró o cambió. Código copiado: " + code,
+                    ToolTipIcon.Warning);
+                return;
+            }
+
+            if (Native.IsIconic(targetWindow))
+                Native.ShowWindow(targetWindow, 9); // SW_RESTORE
+            Native.SetForegroundWindow(targetWindow);
+            await Task.Delay(100); // Dar tiempo a Windows para restaurar el foco.
+            if (Native.GetForegroundWindow() != targetWindow)
+            {
+                Notify("No se pudo activar el navegador. Código copiado: " + code,
+                    ToolTipIcon.Warning);
+                return;
+            }
+
+            // F6 debe haberse pulsado con el campo del código enfocado.
+            SendKeys.SendWait("^a");
+            SendKeys.SendWait("^v");
+            await Task.Delay(160); // El sitio puede procesar el evento de pegado.
+            if (Native.GetForegroundWindow() != targetWindow)
+            {
+                Notify("Se perdió el foco; no se envió Enter. Código copiado: " + code,
+                    ToolTipIcon.Warning);
+                return;
+            }
+            SendKeys.SendWait("{ENTER}");
+            SystemSounds.Asterisk.Play();
+            Notify("Código " + code + " enviado al navegador (Enter). No confirma el canje.");
+        }
+        catch (Exception ex)
+        {
+            Notify(ex.Message, ToolTipIcon.Error);
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private async Task<bool> CopyAsync(string code)
+    {
+        for (int i = 0; i < 4; i++)
         {
             try
             {
-                string? code = await RecognizeCodeAsync(selected);
-                if (code is null)
-                {
-                    tray.ShowBalloonTip(1200, "GTA Codigo OCR",
-                        "No se reconoció un código. Selecciona solo el texto e intenta otra vez.",
-                        ToolTipIcon.Info);
-                    return;
-                }
-                for (int attempt = 0; attempt < 4; attempt++)
-                {
-                    try
-                    {
-                        Clipboard.SetText(code);
-                        SystemSounds.Asterisk.Play();
-                        return;
-                    }
-                    catch (ExternalException) when (attempt < 3)
-                    {
-                        await Task.Delay(35);
-                    }
-                }
+                Clipboard.SetText(code);
+                return true;
             }
-            catch (Exception ex)
+            catch (ExternalException)
             {
-                tray.ShowBalloonTip(2000, "GTA Codigo OCR", ex.Message, ToolTipIcon.Error);
-            }
-            finally
-            {
-                selectingOrReading = false;
+                if (i == 3) return false;
+                await Task.Delay(40);
             }
         }
+        return false;
     }
 
-    private async Task<string?> RecognizeCodeAsync(Bitmap selected)
+    private async Task<OcrDecision> RecognizeWithAgreementAsync(Bitmap source)
     {
-        // OCR rápido: ampliar las capturas pequeñas primero.
-        int zoom = selected.Height <= 110 ? 4 : selected.Height <= 240 ? 3 : 1;
-        using (var normal = MakeOcrImage(selected, zoom, false))
+        // Se prueban TRES variantes distintas de una sola captura, ya que 3/J,
+        // 0/O y 5/S pueden confundirse en subtítulos y tipografías diminutas.
+        // Para enviar automáticamente exigimos dos lecturas iguales y ninguna
+        // contradicción. Esto reduce errores, pero no garantiza el 100 %.
+        int zoom = source.Height <= 130 ? 4 : source.Height <= 260 ? 3 : 2;
+        var readings = new List<string>();
+
+        foreach (ImageVariant variant in new[]
         {
-            string? found = await ReadCodeAsync(normal);
-            if (found is not null) return found;
+            ImageVariant.Bicubic,
+            ImageVariant.Nearest,
+            ImageVariant.Contrast
+        })
+        {
+            using var prepared = MakeOcrImage(source, zoom, variant);
+            using var sb = ToSoftwareBitmap(prepared);
+            var result = await engine.RecognizeAsync(sb);
+            string? code = CodeParser.FindCode(result.Text);
+            if (code is not null) readings.Add(code);
         }
 
-        // Si falla: escala de grises y contraste extra.
-        using (var contrast = MakeOcrImage(selected, zoom == 1 ? 2 : zoom, true))
-        {
-            string? found = await ReadCodeAsync(contrast);
-            if (found is not null) return found;
-        }
+        if (readings.Count == 0)
+            return new(null, "El OCR no encontró un código. Comprueba la zona con F7.");
 
-        // Último intento con la resolución original.
-        using var original = MakeOcrImage(selected, 1, false);
-        return await ReadCodeAsync(original);
+        string[] distinct = readings.Distinct(StringComparer.Ordinal).ToArray();
+        if (distinct.Length > 1)
+            return new(null, "OCR dudoso: " + string.Join(" / ", distinct) +
+                ". No se envió Enter; vuelve a probar.");
+
+        if (readings.Count < 2)
+            return new(null, "Solo una de tres lecturas detectó " + distinct[0] +
+                ". No se envió por seguridad.");
+
+        return new(distinct[0], "OK");
     }
 
-    private async Task<string?> ReadCodeAsync(Bitmap bitmap)
+    private static Bitmap MakeOcrImage(Bitmap source, int targetZoom, ImageVariant variant)
     {
-        using var softwareBitmap = ToSoftwareBitmap(bitmap);
-        var result = await engine.RecognizeAsync(softwareBitmap);
-        return CodeParser.FindCode(result.Text);
-    }
-
-    private static Bitmap MakeOcrImage(Bitmap source, int targetZoom, bool highContrast)
-    {
-        const int margin = 12;
+        const int margin = 14;
         int limit = checked((int)OcrEngine.MaxImageDimension);
-        double zoom = Math.Min(targetZoom,
+        double factor = Math.Min(targetZoom,
             (double)(limit - 2 * margin) / Math.Max(source.Width, source.Height));
-        int width = Math.Max(1, (int)Math.Floor(source.Width * zoom));
-        int height = Math.Max(1, (int)Math.Floor(source.Height * zoom));
-        var output = new Bitmap(width + 2 * margin, height + 2 * margin,
+        int width = Math.Max(1, (int)Math.Floor(source.Width * factor));
+        int height = Math.Max(1, (int)Math.Floor(source.Height * factor));
+        var output = new Bitmap(width + margin * 2, height + margin * 2,
             PixelFormat.Format32bppArgb);
 
-        using (var g = Graphics.FromImage(output))
+        using var g = Graphics.FromImage(output);
+        g.Clear(source.GetPixel(0, 0));
+        g.InterpolationMode = variant == ImageVariant.Nearest
+            ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = variant == ImageVariant.Nearest
+            ? PixelOffsetMode.Half : PixelOffsetMode.HighQuality;
+        Rectangle destination = new(margin, margin, width, height);
+
+        if (variant == ImageVariant.Contrast)
         {
-            g.Clear(source.GetPixel(0, 0));
-            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
-            Rectangle target = new(margin, margin, width, height);
-            if (!highContrast)
+            const float k = 1.6f;
+            const float offset = -0.3f;
+            var matrix = new ColorMatrix(new[]
             {
-                g.DrawImage(source, target, 0, 0, source.Width, source.Height,
-                    GraphicsUnit.Pixel);
-            }
-            else
-            {
-                const float k = 1.65f;
-                const float offset = -0.325f;
-                var matrix = new ColorMatrix(new[]
-                {
-                    new[] { .299f*k, .299f*k, .299f*k, 0f, 0f },
-                    new[] { .587f*k, .587f*k, .587f*k, 0f, 0f },
-                    new[] { .114f*k, .114f*k, .114f*k, 0f, 0f },
-                    new[] { 0f, 0f, 0f, 1f, 0f },
-                    new[] { offset, offset, offset, 0f, 1f }
-                });
-                using var attrs = new ImageAttributes();
-                attrs.SetColorMatrix(matrix);
-                g.DrawImage(source, target, 0, 0, source.Width, source.Height,
-                    GraphicsUnit.Pixel, attrs);
-            }
+                new[] { .299f*k, .299f*k, .299f*k, 0f, 0f },
+                new[] { .587f*k, .587f*k, .587f*k, 0f, 0f },
+                new[] { .114f*k, .114f*k, .114f*k, 0f, 0f },
+                new[] { 0f, 0f, 0f, 1f, 0f },
+                new[] { offset, offset, offset, 0f, 1f }
+            });
+            using var attributes = new ImageAttributes();
+            attributes.SetColorMatrix(matrix);
+            g.DrawImage(source, destination, 0, 0, source.Width, source.Height,
+                GraphicsUnit.Pixel, attributes);
+        }
+        else
+        {
+            g.DrawImage(source, destination, 0, 0, source.Width, source.Height,
+                GraphicsUnit.Pixel);
         }
         return output;
     }
 
     private static SoftwareBitmap ToSoftwareBitmap(Bitmap image)
     {
-        var rectangle = new Rectangle(0, 0, image.Width, image.Height);
-        BitmapData bits = image.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        Rectangle rect = new(0, 0, image.Width, image.Height);
+        BitmapData bits = image.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
         try
         {
             int rowLength = checked(image.Width * 4);
-            var pixels = new byte[checked(rowLength * image.Height)];
+            byte[] pixels = new byte[checked(rowLength * image.Height)];
             for (int y = 0; y < image.Height; y++)
             {
-                // Format32bppArgb guarda cada píxel en orden BGRA en memoria.
                 IntPtr row = IntPtr.Add(bits.Scan0, checked(y * bits.Stride));
                 Marshal.Copy(row, pixels, y * rowLength, rowLength);
             }
-
             using var writer = new DataWriter();
             writer.WriteBytes(pixels);
             IBuffer buffer = writer.DetachBuffer();
@@ -246,9 +375,14 @@ internal sealed class CaptureApplication : ApplicationContext
         }
     }
 
+    private void Notify(string text, ToolTipIcon severity = ToolTipIcon.Info)
+    {
+        tray.ShowBalloonTip(1800, "GTA Codigo OCR V3", text, severity);
+    }
+
     protected override void ExitThreadCore()
     {
-        hotkey.Dispose();
+        hotkeys.Dispose();
         tray.Visible = false;
         tray.Dispose();
         menu.Dispose();
@@ -256,77 +390,122 @@ internal sealed class CaptureApplication : ApplicationContext
     }
 }
 
+internal enum ImageVariant { Bicubic, Nearest, Contrast }
+internal readonly record struct OcrDecision(string? Code, string Message);
+
 internal static class CodeParser
 {
-    private static readonly Regex WithSeparators = new(
+    private static readonly Regex WithDashes = new(
         @"(?<![A-Z0-9])([A-Z0-9]{4})[\s\p{Pd}]+([A-Z0-9]{4})[\s\p{Pd}]+([A-Z0-9]{4})(?![A-Z0-9])",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
-
-    private static readonly Regex WithoutSeparators = new(
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex Continuous = new(
         @"(?<![A-Z0-9])([A-Z0-9]{12})(?![A-Z0-9])",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
 
     public static string? FindCode(string raw)
     {
         string text = raw.ToUpperInvariant();
-        Match match = WithSeparators.Match(text);
+        Match match = WithDashes.Match(text);
         if (match.Success)
             return $"{match.Groups[1].Value}-{match.Groups[2].Value}-{match.Groups[3].Value}";
 
-        match = WithoutSeparators.Match(text);
-        if (match.Success)
-        {
-            string value = match.Groups[1].Value;
-            return $"{value[..4]}-{value.Substring(4, 4)}-{value[8..]}";
-        }
-        return null;
+        match = Continuous.Match(text);
+        if (!match.Success) return null;
+        string value = match.Groups[1].Value;
+        return $"{value[..4]}-{value.Substring(4, 4)}-{value[8..]}";
     }
 }
 
-internal sealed class GlobalHotkey : NativeWindow, IDisposable
+internal static class Native
 {
-    private const int HotkeyId = 1;
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    internal static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    internal static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+}
+
+internal sealed class GlobalHotkeys : NativeWindow, IDisposable
+{
     private const int WmHotkey = 0x0312;
     private const uint ModNoRepeat = 0x4000;
-    private const uint VkF8 = 0x77;
+    private readonly Action<Keys> callback;
+    private readonly List<int> registeredIds = new();
 
-    private readonly Action callback;
-
-    public GlobalHotkey(Action callback)
+    public GlobalHotkeys(Action<Keys> callback)
     {
         this.callback = callback;
-        CreateHandle(new CreateParams { Caption = "GTACodigoOCR-Hotkey" });
-        if (!RegisterHotKey(Handle, HotkeyId, ModNoRepeat, VkF8))
+        CreateHandle(new CreateParams { Caption = "GTACodigoOCR-GlobalHotkeys" });
+        try
         {
-            var error = Marshal.GetLastWin32Error();
-            DestroyHandle();
-            throw new Win32Exception(error, "No se pudo registrar F8. Otra aplicación podría estar usándola.");
+            Register(1, Keys.F6);
+            Register(2, Keys.F7);
+            Register(3, Keys.F8);
         }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    private void Register(int id, Keys key)
+    {
+        if (!RegisterHotKey(Handle, id, ModNoRepeat, (uint)key))
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                $"No fue posible registrar {key}. Es probable que otra aplicación la use.");
+        registeredIds.Add(id);
     }
 
     protected override void WndProc(ref Message message)
     {
-        if (message.Msg == WmHotkey && message.WParam.ToInt32() == HotkeyId)
-            callback();
+        if (message.Msg == WmHotkey)
+        {
+            switch (message.WParam.ToInt32())
+            {
+                case 1: callback(Keys.F6); break;
+                case 2: callback(Keys.F7); break;
+                case 3: callback(Keys.F8); break;
+            }
+        }
         base.WndProc(ref message);
     }
 
     public void Dispose()
     {
-        if (Handle == IntPtr.Zero)
-            return;
-
-        UnregisterHotKey(Handle, HotkeyId);
+        if (Handle == IntPtr.Zero) return;
+        foreach (int id in registeredIds)
+            UnregisterHotKey(Handle, id);
+        registeredIds.Clear();
         DestroyHandle();
     }
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool RegisterHotKey(IntPtr handle, int id, uint modifiers, uint key);
+    private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool UnregisterHotKey(IntPtr handle, int id);
+    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 }
 
 internal sealed class SelectionOverlay : Form
@@ -335,7 +514,7 @@ internal sealed class SelectionOverlay : Form
     private Point? start;
     private Point cursor;
     private bool finished;
-    public event Action<Bitmap?>? Completed;
+    public event Action<Rectangle?>? Completed;
 
     public SelectionOverlay(Bitmap frozenScreen, Rectangle virtualScreen)
     {
@@ -374,9 +553,8 @@ internal sealed class SelectionOverlay : Form
         Capture = false;
         Rectangle area = Rectangle.Intersect(GetSelection(start.Value, e.Location),
             new Rectangle(Point.Empty, ClientSize));
-        Bitmap? cropped = area.Width >= 8 && area.Height >= 8
-            ? screenshot.Clone(area, PixelFormat.Format32bppArgb) : null;
-        Finish(cropped);
+        Rectangle absolute = new(area.X + Left, area.Y + Top, area.Width, area.Height);
+        Finish(area.Width >= 8 && area.Height >= 8 ? absolute : null);
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
@@ -418,13 +596,9 @@ internal sealed class SelectionOverlay : Form
         base.Dispose(disposing);
     }
 
-    private void Finish(Bitmap? selected)
+    private void Finish(Rectangle? selected)
     {
-        if (finished)
-        {
-            selected?.Dispose();
-            return;
-        }
+        if (finished) return;
         finished = true;
         Hide();
         try { Completed?.Invoke(selected); }
