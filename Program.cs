@@ -74,25 +74,35 @@ internal sealed class CaptureApplication : ApplicationContext
 
     private void StartSelection()
     {
-        if (selectingOrReading)
-            return;
-
+        if (selectingOrReading) return;
         selectingOrReading = true;
+        Bitmap? snapshot = null;
+        SelectionOverlay? overlay = null;
         try
         {
-            var overlay = new SelectionOverlay();
+            // F8 congela el fotograma en memoria: no se pierde el código mientras seleccionas.
+            Rectangle desktop = SystemInformation.VirtualScreen;
+            snapshot = new Bitmap(desktop.Width, desktop.Height, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(snapshot))
+                g.CopyFromScreen(desktop.Location, Point.Empty, desktop.Size,
+                    CopyPixelOperation.SourceCopy);
+
+            overlay = new SelectionOverlay(snapshot, desktop);
+            snapshot = null;
             overlay.Completed += OnSelectionCompleted;
             overlay.Show();
             overlay.Activate();
         }
-        catch
+        catch (Exception ex)
         {
+            overlay?.Dispose();
+            snapshot?.Dispose();
             selectingOrReading = false;
-            throw;
+            tray.ShowBalloonTip(2000, "GTA Codigo OCR", ex.Message, ToolTipIcon.Error);
         }
     }
 
-    private async void OnSelectionCompleted(Rectangle? selected)
+    private async void OnSelectionCompleted(Bitmap? selected)
     {
         if (selected is null)
         {
@@ -100,95 +110,113 @@ internal sealed class CaptureApplication : ApplicationContext
             return;
         }
 
-        try
+        using (selected)
         {
-            // Espera brevemente a que Windows retire la superposición de pantalla.
-            await Task.Delay(65);
-
-            using var bitmap = new Bitmap(selected.Value.Width, selected.Value.Height, PixelFormat.Format32bppArgb);
-            using (var graphics = Graphics.FromImage(bitmap))
+            try
             {
-                graphics.CopyFromScreen(selected.Value.Location, Point.Empty, selected.Value.Size,
-                    CopyPixelOperation.SourceCopy);
-            }
-
-            string? code = await RecognizeCodeAsync(bitmap);
-            if (code is null)
-            {
-                tray.ShowBalloonTip(1000, "GTA Codigo OCR",
-                    "No se encontró un código de 12 caracteres. Selecciona una zona más ajustada.",
-                    ToolTipIcon.Info);
-                return;
-            }
-
-            // Esta continuación vuelve al hilo STA de Windows Forms.
-            for (int attempt = 0; attempt < 4; attempt++)
-            {
-                try
+                string? code = await RecognizeCodeAsync(selected);
+                if (code is null)
                 {
-                    Clipboard.SetText(code);
-                    SystemSounds.Asterisk.Play();
+                    tray.ShowBalloonTip(1200, "GTA Codigo OCR",
+                        "No se reconoció un código. Selecciona solo el texto e intenta otra vez.",
+                        ToolTipIcon.Info);
                     return;
                 }
-                catch (ExternalException) when (attempt < 3)
+                for (int attempt = 0; attempt < 4; attempt++)
                 {
-                    await Task.Delay(35);
+                    try
+                    {
+                        Clipboard.SetText(code);
+                        SystemSounds.Asterisk.Play();
+                        return;
+                    }
+                    catch (ExternalException) when (attempt < 3)
+                    {
+                        await Task.Delay(35);
+                    }
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            tray.ShowBalloonTip(2000, "GTA Codigo OCR", ex.Message, ToolTipIcon.Error);
-        }
-        finally
-        {
-            selectingOrReading = false;
+            catch (Exception ex)
+            {
+                tray.ShowBalloonTip(2000, "GTA Codigo OCR", ex.Message, ToolTipIcon.Error);
+            }
+            finally
+            {
+                selectingOrReading = false;
+            }
         }
     }
 
-    private async Task<string?> RecognizeCodeAsync(Bitmap original)
+    private async Task<string?> RecognizeCodeAsync(Bitmap selected)
     {
-        using var image = MakeOcrImage(original, upscale: false);
-        using (var softwareBitmap = ToSoftwareBitmap(image))
+        // OCR rápido: ampliar las capturas pequeñas primero.
+        int zoom = selected.Height <= 110 ? 4 : selected.Height <= 240 ? 3 : 1;
+        using (var normal = MakeOcrImage(selected, zoom, false))
         {
-            var result = await engine.RecognizeAsync(softwareBitmap);
-            string? found = CodeParser.FindCode(result.Text);
-            if (found is not null)
-                return found;
+            string? found = await ReadCodeAsync(normal);
+            if (found is not null) return found;
         }
 
-        // Un segundo intento a mayor resolución ayuda cuando el código es muy pequeño.
-        if (original.Width <= 800 && original.Height <= 240)
+        // Si falla: escala de grises y contraste extra.
+        using (var contrast = MakeOcrImage(selected, zoom == 1 ? 2 : zoom, true))
         {
-            using var enlarged = MakeOcrImage(original, upscale: true);
-            using var softwareBitmap = ToSoftwareBitmap(enlarged);
-            var retry = await engine.RecognizeAsync(softwareBitmap);
-            return CodeParser.FindCode(retry.Text);
+            string? found = await ReadCodeAsync(contrast);
+            if (found is not null) return found;
         }
 
-        return null;
+        // Último intento con la resolución original.
+        using var original = MakeOcrImage(selected, 1, false);
+        return await ReadCodeAsync(original);
     }
 
-    private Bitmap MakeOcrImage(Bitmap source, bool upscale)
+    private async Task<string?> ReadCodeAsync(Bitmap bitmap)
     {
-        int factor = upscale ? 2 : 1;
-        int width = source.Width * factor;
-        int height = source.Height * factor;
+        using var softwareBitmap = ToSoftwareBitmap(bitmap);
+        var result = await engine.RecognizeAsync(softwareBitmap);
+        return CodeParser.FindCode(result.Text);
+    }
+
+    private static Bitmap MakeOcrImage(Bitmap source, int targetZoom, bool highContrast)
+    {
+        const int margin = 12;
         int limit = checked((int)OcrEngine.MaxImageDimension);
-        if (Math.Max(width, height) > limit)
-        {
-            double ratio = (double)limit / Math.Max(width, height);
-            width = Math.Max(1, (int)(width * ratio));
-            height = Math.Max(1, (int)(height * ratio));
-        }
+        double zoom = Math.Min(targetZoom,
+            (double)(limit - 2 * margin) / Math.Max(source.Width, source.Height));
+        int width = Math.Max(1, (int)Math.Floor(source.Width * zoom));
+        int height = Math.Max(1, (int)Math.Floor(source.Height * zoom));
+        var output = new Bitmap(width + 2 * margin, height + 2 * margin,
+            PixelFormat.Format32bppArgb);
 
-        var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
-        using (var graphics = Graphics.FromImage(bitmap))
+        using (var g = Graphics.FromImage(output))
         {
-            graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-            graphics.DrawImage(source, 0, 0, width, height);
+            g.Clear(source.GetPixel(0, 0));
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            Rectangle target = new(margin, margin, width, height);
+            if (!highContrast)
+            {
+                g.DrawImage(source, target, 0, 0, source.Width, source.Height,
+                    GraphicsUnit.Pixel);
+            }
+            else
+            {
+                const float k = 1.65f;
+                const float offset = -0.325f;
+                var matrix = new ColorMatrix(new[]
+                {
+                    new[] { .299f*k, .299f*k, .299f*k, 0f, 0f },
+                    new[] { .587f*k, .587f*k, .587f*k, 0f, 0f },
+                    new[] { .114f*k, .114f*k, .114f*k, 0f, 0f },
+                    new[] { 0f, 0f, 0f, 1f, 0f },
+                    new[] { offset, offset, offset, 0f, 1f }
+                });
+                using var attrs = new ImageAttributes();
+                attrs.SetColorMatrix(matrix);
+                g.DrawImage(source, target, 0, 0, source.Width, source.Height,
+                    GraphicsUnit.Pixel, attrs);
+            }
         }
-        return bitmap;
+        return output;
     }
 
     private static SoftwareBitmap ToSoftwareBitmap(Bitmap image)
@@ -303,21 +331,20 @@ internal sealed class GlobalHotkey : NativeWindow, IDisposable
 
 internal sealed class SelectionOverlay : Form
 {
+    private readonly Bitmap screenshot;
     private Point? start;
     private Point cursor;
     private bool finished;
+    public event Action<Bitmap?>? Completed;
 
-    public event Action<Rectangle?>? Completed;
-
-    public SelectionOverlay()
+    public SelectionOverlay(Bitmap frozenScreen, Rectangle virtualScreen)
     {
+        screenshot = frozenScreen;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
-        Bounds = SystemInformation.VirtualScreen;
+        Bounds = virtualScreen;
         TopMost = true;
         ShowInTaskbar = false;
-        BackColor = Color.Black;
-        Opacity = 0.24;
         Cursor = Cursors.Cross;
         KeyPreview = true;
         DoubleBuffered = true;
@@ -326,8 +353,7 @@ internal sealed class SelectionOverlay : Form
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
-        if (e.Button != MouseButtons.Left)
-            return;
+        if (e.Button != MouseButtons.Left) return;
         start = e.Location;
         cursor = e.Location;
         Capture = true;
@@ -336,8 +362,7 @@ internal sealed class SelectionOverlay : Form
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        if (start is null)
-            return;
+        if (start is null) return;
         cursor = e.Location;
         Invalidate();
     }
@@ -345,30 +370,36 @@ internal sealed class SelectionOverlay : Form
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
-        if (e.Button != MouseButtons.Left || start is null)
-            return;
+        if (e.Button != MouseButtons.Left || start is null) return;
         Capture = false;
-        Rectangle local = GetSelection(start.Value, e.Location);
-        var screenRectangle = new Rectangle(local.X + Left, local.Y + Top, local.Width, local.Height);
-        screenRectangle = Rectangle.Intersect(screenRectangle, SystemInformation.VirtualScreen);
-        Finish(screenRectangle.Width >= 8 && screenRectangle.Height >= 8 ? screenRectangle : null);
+        Rectangle area = Rectangle.Intersect(GetSelection(start.Value, e.Location),
+            new Rectangle(Point.Empty, ClientSize));
+        Bitmap? cropped = area.Width >= 8 && area.Height >= 8
+            ? screenshot.Clone(area, PixelFormat.Format32bppArgb) : null;
+        Finish(cropped);
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
-        if (e.KeyCode == Keys.Escape)
-            Finish(null);
+        if (e.KeyCode == Keys.Escape) Finish(null);
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        if (start is null)
-            return;
-        Rectangle selection = GetSelection(start.Value, cursor);
-        using var pen = new Pen(Color.White, 3);
-        e.Graphics.DrawRectangle(pen, selection);
+        e.Graphics.DrawImageUnscaled(screenshot, Point.Empty);
+        using (var shade = new SolidBrush(Color.FromArgb(125, Color.Black)))
+            e.Graphics.FillRectangle(shade, ClientRectangle);
+        if (start is null) return;
+        Rectangle area = Rectangle.Intersect(GetSelection(start.Value, cursor),
+            new Rectangle(Point.Empty, ClientSize));
+        if (area.Width > 0 && area.Height > 0)
+        {
+            e.Graphics.DrawImage(screenshot, area, area, GraphicsUnit.Pixel);
+            using var pen = new Pen(Color.White, 2);
+            e.Graphics.DrawRectangle(pen, area);
+        }
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -381,17 +412,26 @@ internal sealed class SelectionOverlay : Form
         base.OnFormClosed(e);
     }
 
-    private void Finish(Rectangle? rectangle)
+    protected override void Dispose(bool disposing)
     {
-        if (finished)
-            return;
-        finished = true;
-        Hide();
-        Completed?.Invoke(rectangle);
-        Close();
+        if (disposing) screenshot.Dispose();
+        base.Dispose(disposing);
     }
 
-    private static Rectangle GetSelection(Point p1, Point p2) => Rectangle.FromLTRB(
-        Math.Min(p1.X, p2.X), Math.Min(p1.Y, p2.Y),
-        Math.Max(p1.X, p2.X), Math.Max(p1.Y, p2.Y));
+    private void Finish(Bitmap? selected)
+    {
+        if (finished)
+        {
+            selected?.Dispose();
+            return;
+        }
+        finished = true;
+        Hide();
+        try { Completed?.Invoke(selected); }
+        finally { Close(); }
+    }
+
+    private static Rectangle GetSelection(Point a, Point b) => Rectangle.FromLTRB(
+        Math.Min(a.X, b.X), Math.Min(a.Y, b.Y),
+        Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
 }
